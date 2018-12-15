@@ -1,0 +1,44 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta name="generator" content="Hexo 3.8.0"><meta http-equiv="content-type" content="text/html; charset=utf-8"><meta content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0" name="viewport"><meta content="yes" name="apple-mobile-web-app-capable"><meta content="black-translucent" name="apple-mobile-web-app-status-bar-style"><meta content="telephone=no" name="format-detection"><meta name="description" content="生活,IT"><title>raft源码解读 | 沉定修</title><link rel="stylesheet" type="text/css" href="/css/style.css?v=0.0.0"><link rel="stylesheet" type="text/css" href="//lib.baomitu.com/normalize/8.0.1/normalize.min.css"><link rel="stylesheet" type="text/css" href="//lib.baomitu.com/pure/1.0.0/pure-min.css"><link rel="stylesheet" type="text/css" href="//lib.baomitu.com/pure/1.0.0/grids-responsive-min.css"><link rel="stylesheet" href="//lib.baomitu.com/font-awesome/4.7.0/css/font-awesome.min.css"><script type="text/javascript" src="//lib.baomitu.com/jquery/3.3.1/jquery.min.js"></script><link rel="icon" mask="" sizes="any" href="/favicon.ico"><link rel="Shortcut Icon" type="image/x-icon" href="/favicon.ico"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><link rel="apple-touch-icon-precomposed" href="/apple-touch-icon.png"></head><body><div class="body_container"><div id="header"><div class="site-name"><h1 class="hidden">raft源码解读</h1><a id="logo" href="/.">沉定修</a><p class="description"></p></div><div id="nav-menu"><a class="current" href="/."><i class="fa fa-home"> 首页</i></a><a href="/archives/"><i class="fa fa-archive"> 归档</i></a><a href="/about/"><i class="fa fa-user"> 关于</i></a><a href="/atom.xml"><i class="fa fa-rss"> 订阅</i></a></div></div><div class="pure-g" id="layout"><div class="pure-u-1 pure-u-md-3-4"><div class="content_container"><div class="post"><h1 class="post-title">raft源码解读</h1><div class="post-meta">Nov 27, 2017</div><div class="post-content"><p>以下是 hashicorp/raft 1.0 第一次源码阅读后的整理。根据经验，最开始往往有理解不正确的地方，后续加深理解后再整理修正，并与当前对比</p>
+<h2 id="1-Apply过程"><a href="#1-Apply过程" class="headerlink" title="1. Apply过程"></a>1. Apply过程</h2><h3 id="1-1-leader"><a href="#1-1-leader" class="headerlink" title="1.1 leader"></a>1.1 leader</h3><ul>
+<li>api.Apply 写logfuture到r.applyCh</li>
+<li>raft.leaderLoop 读applyCh然后调用 dispatchLogs</li>
+<li>raft.dispatchLogs 先写入到leaderStare的inflight,再持久化到logStore，然后通知commit(commitCh)，最后通知复制log(triggerCh)</li>
+<li>先说commit链路。raft.leaderLoop处理commit，循环从leaderState中读出每个待提交的LogFuture,然后调用r.processLogs</li>
+<li>raft.processLogs循环调用processLog，里面向fsmMutateCh写入构造的commitTuple消息</li>
+<li>fsm.runFSM读fsmMutateCh，执行commit函数，这个函数里面调用fsm对象的Apply方法，这个方法需要由用户自定义实现。</li>
+<li>再回到复制链路。启动时，每个follower都创建1个goroutine，运行r.replicate函数</li>
+<li>获得lastIndex，构造tranReq，r.setupAppendEntries从logstore读出需复制的log</li>
+<li>r.trans.AppendEntries 执行RPC</li>
+<li>commit补充。leader被通知commitCh，是当大多数follower复制成功消息后才被通知提交的。</li>
+<li>复制链路有个commitTimeout(默认50ms), 定期把当前的commitIndex等信息通过RPC传递到Follower。Command类型还是AppendEntriesRequest</li>
+</ul>
+<h3 id="1-2-Follower"><a href="#1-2-Follower" class="headerlink" title="1.2 Follower"></a>1.2 Follower</h3><ul>
+<li>raft.runFollower 读r.rpcCh，然后调用processRPC处理</li>
+<li>检查rpc的类型，处理AppendEntriesRequest</li>
+<li>检查一大堆，然后先持久化到logStore，再commit。</li>
+<li>commit过程与leader类似，调用processLogs进行处理。</li>
+</ul>
+<h2 id="2-Term变化过程"><a href="#2-Term变化过程" class="headerlink" title="2. Term变化过程"></a>2. Term变化过程</h2><ul>
+<li>先进入到 Candidate 状态</li>
+<li>选举自己。发送投票请求给其它节点，请求包括currentTerm，lastTerm,lastIndex.</li>
+<li>优先投票给currentTerm，lastTerm，lastIndex最大的node</li>
+</ul>
+<h2 id="3-Node变化过程"><a href="#3-Node变化过程" class="headerlink" title="3. Node变化过程"></a>3. Node变化过程</h2><ul>
+<li>添加节点。api.AddVoter必须在leader执行. 先更新configurations，接着调用dispatchLogs;<br>调用startStopReplication 启动新节点的复制goroutine。</li>
+<li>删除节点。api.RemoveServer也必须在leader执行。流程和添加节点类似，commandType 变成RemoveServer。<br>删除leader节点，触发重新选举。处理完log提交后，修改状态 stepdown 为true，然后关闭或者变成Follower。</li>
+<li>节点故障。 Follower的心跳超时，改变状态为 Candidate 重新选举。</li>
+</ul>
+<h2 id="4-snapshot-过程"><a href="#4-snapshot-过程" class="headerlink" title="4. snapshot 过程"></a>4. snapshot 过程</h2><ul>
+<li>r.runSnapshots 默认每隔120s 检查一次上次snapshot的index和当前最新的index，二者差值超过8192，执行snapshot</li>
+<li>先创建snapshot的sink，然后持久化，再接着compactLog(删除已经snapshot的log)</li>
+<li>无论leader还是Follower都启动snapshot的goroutine</li>
+</ul>
+<h2 id="5-restore-过程"><a href="#5-restore-过程" class="headerlink" title="5. restore 过程"></a>5. restore 过程</h2><ul>
+<li>新加入的节点，状态为Fllower</li>
+<li>leader主动同步log到新节点</li>
+<li>构造复制请求时，发现需要同步很久以前的log，且当前logstore不存在该log</li>
+<li>此时发起installSnapshot的请求给Follower，取消同步log的请求</li>
+<li>follwer接收snapshot并应用到本地</li>
+<li>leader的周期同步commit的机制逐步把最近的log同步给Follower</li>
+</ul>
+</div><div class="tags"></div><div class="post-nav"><a class="pre" href="/2017/12/04/influxdb-http/">influx_http_service</a><a class="next" href="/2017/11/17/tsdb-requirements/">tsdb_requirements</a></div></div></div></div><div class="pure-u-1-4 hidden_mid_and_down"><div id="sidebar"><div class="widget"><form class="search-form" action="//www.google.com/search" method="get" accept-charset="utf-8" target="_blank"><input type="text" name="q" maxlength="20" placeholder="Search"><input type="hidden" name="sitesearch" value="http://colinsage.github.io"></form></div><div class="widget"><div class="widget-title"><i class="fa fa-folder-o"> 分类</i></div></div><div class="widget"><div class="widget-title"><i class="fa fa-star-o"> 标签</i></div><div class="tagcloud"><a href="/tags/influxdb/" style="font-size: 15px;">influxdb</a> <a href="/tags/tsdb/" style="font-size: 15px;">tsdb</a> <a href="/tags/tips/" style="font-size: 15px;">tips</a> <a href="/tags/life/" style="font-size: 15px;">life</a> <a href="/tags/influxdb-sql-tsm/" style="font-size: 15px;">influxdb sql tsm</a></div></div><div class="widget"><div class="widget-title"><i class="fa fa-file-o"> 最近文章</i></div><ul class="post-list"><li class="post-list-item"><a class="post-list-link" href="/2018/06/06/think/">6月小结</a></li><li class="post-list-item"><a class="post-list-link" href="/2018/05/28/influxdb-compress/">influxdb-compress</a></li><li class="post-list-item"><a class="post-list-link" href="/2018/03/20/grpc-go/">grpc-go</a></li><li class="post-list-item"><a class="post-list-link" href="/2018/02/28/tips/">tips</a></li><li class="post-list-item"><a class="post-list-link" href="/2018/02/28/tsdb-references/">tsdb_references</a></li><li class="post-list-item"><a class="post-list-link" href="/2018/02/27/influxdb-monitor/">influxdb_monitor</a></li><li class="post-list-item"><a class="post-list-link" href="/2017/12/04/influxdb-http/">influx_http_service</a></li><li class="post-list-item"><a class="post-list-link" href="/2017/11/27/raft/">raft源码解读</a></li><li class="post-list-item"><a class="post-list-link" href="/2017/11/17/tsdb-requirements/">tsdb_requirements</a></li><li class="post-list-item"><a class="post-list-link" href="/2017/11/13/misc/">20171113-misc</a></li></ul></div><div class="widget"><div class="widget-title"><i class="fa fa-external-link"> 友情链接</i></div><ul></ul><a href="http://www.example1.com/" title="site-name1" target="_blank">site-name1</a><ul></ul><a href="http://www.example2.com/" title="site-name2" target="_blank">site-name2</a><ul></ul><a href="http://www.example3.com/" title="site-name3" target="_blank">site-name3</a></div></div></div><div class="pure-u-1 pure-u-md-3-4"><div id="footer">Copyright © 2018 <a href="/." rel="nofollow">沉定修.</a> Powered by<a rel="nofollow" target="_blank" href="https://hexo.io"> Hexo.</a><a rel="nofollow" target="_blank" href="https://github.com/tufu9441/maupassant-hexo"> Theme</a> by<a rel="nofollow" target="_blank" href="https://github.com/pagecho"> Cho.</a></div></div></div><a class="show" id="rocket" href="#top"></a><script type="text/javascript" src="/js/totop.js?v=0.0.0" async></script><script type="text/javascript" src="//lib.baomitu.com/fancybox/3.5.2/jquery.fancybox.min.js" async></script><script type="text/javascript" src="/js/fancybox.js?v=0.0.0" async></script><link rel="stylesheet" type="text/css" href="//lib.baomitu.com/fancybox/3.5.2/jquery.fancybox.min.css"><script type="text/javascript" src="/js/codeblock-resizer.js?v=0.0.0"></script><script type="text/javascript" src="/js/smartresize.js?v=0.0.0"></script></div></body></html>
